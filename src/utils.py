@@ -7,10 +7,14 @@ from numpy import linalg as LA
 from sklearn.neighbors import NearestNeighbors
 import time
 
+import tensorflow as tf
+
 
 def vec_length(vec):
     return LA.norm(vec)
 
+def sigmoid(x, derivative=False):
+    return x*(1-x) if derivative else 1/(1+np.exp(-x))
 
 class IndexScore:
     """

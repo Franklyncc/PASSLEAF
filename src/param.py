@@ -20,6 +20,7 @@ test_hrmap = False
 reg_scale = None  # coefficient for regularizer (lambda)
 data_dir = None
 save_dir = None
+psl = True
 
 def data_dir():
     return join('./data', whichdata)

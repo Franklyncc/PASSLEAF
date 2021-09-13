@@ -26,6 +26,7 @@ class Data(object):
         # save triples as array of indices
         self.triples = np.array([0])  # training dataset
         self.val_triples = np.array([0])  # validation dataset
+        self.test_triples = np.array([0])  # testing dataset
         self.soft_logic_triples = np.array([0])
 
         # (h,r,t) tuples(int), no w
@@ -74,10 +75,11 @@ class Data(object):
             self.triples_record.add((h, r, t))
         return np.array(triples)
 
-    def load_data(self, file_train, file_val, file_psl=None, splitter='\t', line_end='\n'):
+    def load_data(self, file_train, file_val, file_test, file_psl=None, splitter='\t', line_end='\n'):
 
         self.triples = self.load_triples(file_train, splitter, line_end)
         self.val_triples = self.load_triples(file_val, splitter, line_end)
+        self.test_triples = self.load_triples(file_test, splitter, line_end)
 
         if file_psl is not None:
             self.soft_logic_triples = self.load_triples(file_psl, splitter, line_end)
@@ -127,24 +129,28 @@ class Data(object):
         '''For relation `rel_str` in string, returns its index.
 
         This is not used in training, but can be helpful for visualizing/debugging etc.'''
+        # return int(rel_str)
         return self.index_rels.get(rel_str)
 
     def rel_index2str(self, rel_index):
         '''For relation `rel_index` in int, returns its string.
 
         This is not used in training, but can be helpful for visualizing/debugging etc.'''
+        # return str(rel_index)
         return self.rels[rel_index]
 
     def con_str2index(self, con_str):
         '''For ontology `con_str` in string, returns its index.
 
         This is not used in training, but can be helpful for visualizing/debugging etc.'''
+        # return int(con_str)
         return self.index_cons.get(con_str)
 
     def con_index2str(self, con_index):
         '''For ontology `con_index` in int, returns its string.
 
         This is not used in training, but can be helpful for visualizing/debugging etc.'''
+        # return str(con_index)
         return self.cons[con_index]
 
     def rel(self):
@@ -305,3 +311,33 @@ class BatchLoader():
         neg_tn_batch = np.random.randint(0, N, size=(self.batch_size, self.neg_per_positive))
 
         return neg_hn_batch, neg_rel_hn_batch, neg_t_batch, neg_h_batch, neg_rel_tn_batch, neg_tn_batch
+
+
+class DataNoIdMapping(Data):
+    def rel_str2index(self, rel_str):
+        '''For relation `rel_str` in string, returns its index.
+
+        This is not used in training, but can be helpful for visualizing/debugging etc.'''
+        return int(rel_str)
+        # return self.index_rels.get(rel_str)
+
+    def rel_index2str(self, rel_index):
+        '''For relation `rel_index` in int, returns its string.
+
+        This is not used in training, but can be helpful for visualizing/debugging etc.'''
+        return str(rel_index)
+        # return self.rels[rel_index]
+
+    def con_str2index(self, con_str):
+        '''For ontology `con_str` in string, returns its index.
+
+        This is not used in training, but can be helpful for visualizing/debugging etc.'''
+        return int(con_str)
+        # return self.index_cons.get(con_str)
+
+    def con_index2str(self, con_index):
+        '''For ontology `con_index` in int, returns its string.
+
+        This is not used in training, but can be helpful for visualizing/debugging etc.'''
+        return str(con_index)
+        # return self.cons[con_index]

@@ -11,7 +11,8 @@ import heapq as HP
 import pandas as pd
 import os
 
-from scipy.special import expit as sigmoid
+# from scipy.special import expit as sigmoid
+from utils import sigmoid
 
 import sys
 
@@ -27,7 +28,9 @@ import random
 import sklearn
 from sklearn import tree
 
-from src.models import UKGE_logi_TF, UKGE_rect_TF
+import scipy
+
+from src.models import * #UKGE_logi_TF, UKGE_rect_TF, TransE_m1_TF, DistMult_m1_TF
 
 
 # This class is used to load and combine a TF_Parts and a Data object, and provides some useful methods for training
@@ -66,6 +69,18 @@ class Tester(object):
     def build_by_file(self, test_data_file, model_dir, model_filename='xcn-distmult.ckpt', data_filename='xc-data.bin'):
         # load the saved Data()
         self.this_data = data.Data()
+        data_save_path = join(model_dir, data_filename)
+        self.this_data.load(data_save_path)
+
+        # load testing data
+        self.load_test_data(test_data_file)
+
+        self.model_dir = model_dir  # used for saving
+
+    # completed by child class
+    def build_by_file_no_id_mapping(self, test_data_file, model_dir, model_filename='xcn-distmult.ckpt', data_filename='xc-data.bin'):
+        # load the saved Data()
+        self.this_data = data.DataNoIdMapping()
         data_save_path = join(model_dir, data_filename)
         self.this_data.load(data_save_path)
 
@@ -332,7 +347,7 @@ class Tester(object):
         return self.get_score_batch(h_batch, r_batch, t_batch, isneg2Dbatch)
 
 
-    def get_mse(self, verbose=True, save_dir='', epoch=0):
+    def get_mse(self, toprint=True, save_dir='', epoch=0):
         test_triples = self.test_triples
         N = test_triples.shape[0]
 
@@ -433,8 +448,15 @@ class Tester(object):
         """
         q = []  # min heap
         N = self.vec_c.shape[0]  # the total number of concepts
+        
+        scores_cache = self.get_score_batch(
+            np.repeat(h, N), 
+            np.repeat(r, N), 
+            np.arange(0, N)
+        )
         for t_idx in range(N):
-            score = self.get_score(h, r, t_idx)
+            score = scores_cache[t_idx]
+            
             if len(q) < k:
                 HP.heappush(q, self.IndexScore(t_idx, score))
             else:
@@ -453,39 +475,81 @@ class Tester(object):
 
         return indices, scores
 
-    def get_t_ranks(self, h, r, ts):
+    def get_t_ranks(self, h, r, ts, accurate_mode=False):
         """
+        :param accurate_mode: set this flag to disable "Fast Ranking"
         Given some t index, return the ranks for each t
         :return:
         """
         # prediction
-        scores = np.array([self.get_score(h, r, t) for t in ts])  # predict scores for t from ground truth
+        assert len(ts) == len(np.unique(ts))
+        # scores = np.array([self.get_score(h, r, t) for t in ts])  # predict scores for t from ground truth
+        # scores = self.get_score_batch(
+        #             np.repeat(h, len(ts)), 
+        #             np.repeat(r, len(ts)), 
+        #             ts
+        #         )
 
-        ranks = np.ones(len(ts), dtype=int)  # initialize rank as all 1
+        # ranks = np.ones(len(ts), dtype=int)  # initialize rank as all 1
 
         N = self.vec_c.shape[0]  # pool of t: all concept vectors
-        for i in range(N):  # compute scores for all concept vectors as t
-            score_i = self.get_score(h, r, i)
-            rankplus = (scores < score_i).astype(int)  # rank+1 if score<score_i
-            ranks += rankplus
+
+        scores_cache = self.get_score_batch(
+            np.repeat(h, N), 
+            np.repeat(r, N), 
+            np.arange(0, N)
+        )
+        scores = scores_cache[ts]
+        
+
+        # import time
+        # tStart = time.time()
+        # for i in range(N):  # compute scores for all concept vectors as t
+        #     # score_i = self.get_score(h, r, i)
+        #     score_i = scores_cache[i]
+        #     rankplus = (scores < score_i).astype(int)  # rank+1 if score<score_i
+        #     ranks += rankplus
+
+        #     # if score_i == 1:
+        #     #     print('[WARN] score_i is 1!')
+        #     #     print(ranks)
+
+        # tEnd = time.time()
+        # print("1. It cost %f sec" % (tEnd - tStart))
+
+        # tStart = time.time()
+
+        if accurate_mode:
+            ranks = scipy.stats.rankdata(scores_cache, method='ordinal')[ts]
+            ranks = N - ranks + 1
+        else: # fast ranking (erroneous when there are ties in the scores)
+            ranks = np.sum(scores < np.tile(scores_cache, (len(ts),1)).transpose(), axis=0) + 1
+
+        # tEnd = time.time()
+        # print("2. It cost %f sec" % (tEnd - tStart))
+        
 
         return ranks
 
-    def ndcg(self, h, r, tw_truth):
+    def ndcg(self, h, r, tw_truth, verbose, accurate_mode=False):
         """
         Compute nDCG(normalized discounted cummulative gain)
         sum(score_ground_truth / log2(rank+1)) / max_possible_dcg
         :param tw_truth: [IndexScore1, IndexScore2, ...], soreted by IndexScore.score descending
+        :param accurate_mode: set this flag to disable "Fast Ranking"
         :return:
         """
         # prediction
         ts = [tw.index for tw in tw_truth]
-        ranks = self.get_t_ranks(h, r, ts)
+        ranks = self.get_t_ranks(h, r, ts, accurate_mode=accurate_mode)
 
         # linear gain
         gains = np.array([tw.score for tw in tw_truth])
+        # print('gains')
+        # print(gains)
         discounts = np.log2(ranks + 1)
         discounted_gains = gains / discounts
+
         dcg = np.sum(discounted_gains)  # discounted cumulative gain
         # normalize
         max_possible_dcg = np.sum(gains / np.log2(np.arange(len(gains)) + 2))  # when ranks = [1, 2, ...len(truth)]
@@ -493,18 +557,38 @@ class Tester(object):
 
         # exponential gain
         exp_gains = np.array([2 ** tw.score - 1 for tw in tw_truth])
+        # print('exp_gains')
+        # print(exp_gains)
         exp_discounted_gains = exp_gains / discounts
+        # print('discounts')
+        # print(discounts)
         exp_dcg = np.sum(exp_discounted_gains)
+        # print('exp_dcg')
+        # print(exp_dcg)
         # normalize
         exp_max_possible_dcg = np.sum(
             exp_gains / np.log2(np.arange(len(exp_gains)) + 2))  # when ranks = [1, 2, ...len(truth)]
+        # print('exp_max_possible_dcg')
+        # print(exp_max_possible_dcg)
         exp_ndcg = exp_dcg / exp_max_possible_dcg  # normalized discounted cumulative gain
+
+        
+
+        if verbose:
+            if ndcg > 1.001:
+                print('[Error] nDCG > 1. (', ndcg, ')')
+            if exp_ndcg > 1.001:
+                print('[Error] exp nDCG > 1. (', exp_ndcg, ')')
+
+            print(ranks)
+            print(gains)
 
         return ndcg, exp_ndcg
 
-    def mean_ndcg(self, hr_map):
+    def mean_ndcg(self, hr_map, verbose=False, accurate_mode=False):
         """
         :param hr_map: {h:{r:{t:w}}}
+        :param accurate_mode: set this flag to disable "Fast Ranking"
         :return:
         """
         ndcg_sum = 0  # nDCG with linear gain
@@ -516,25 +600,182 @@ class Tester(object):
         # debug ndcg
         res = []  # [(h,r,tw_truth, ndcg)]
 
+        r_N = self.vec_r.shape[0]
+        ndcg_sum_r = np.zeros(r_N)
+        count_r = np.zeros(r_N)
+
+        all_ndcg = []
+
+
         for h in hr_map:
             for r in hr_map[h]:
                 tw_dict = hr_map[h][r]  # {t:w}
                 tw_truth = [self.IndexScore(t, w) for t, w in tw_dict.items()]
                 tw_truth.sort(reverse=True)  # descending on w
-                ndcg, exp_ndcg = self.ndcg(h, r, tw_truth)  # nDCG with linear gain and exponential gain
+                ndcg, exp_ndcg = self.ndcg(h, r, tw_truth, verbose, accurate_mode=accurate_mode)  # nDCG with linear gain and exponential gain
                 ndcg_sum += ndcg
                 exp_ndcg_sum += exp_ndcg
                 count += 1
+                all_ndcg.append([h, r, len(hr_map[h][r].values()), max(hr_map[h][r].values()), ndcg, exp_ndcg])
+
+                ndcg_sum_r[r] += ndcg
+                count_r[r] += 1
+
+                if verbose:
+                    print(h, r, ndcg, exp_ndcg)
+                    
                 # if count % 100 == 0:
                 #     print('Processed %d, time %s' % (count, (time.time() - t0)))
                 #     print('mean ndcg (linear gain) now: %f' % (ndcg_sum / count))
                 #     print('mean ndcg (exponential gain) now: %f' % (exp_ndcg_sum / count))
 
                 # debug
-                ranks = self.get_t_ranks(h, r, [tw.index for tw in tw_truth])
-                res.append((h,r,tw_truth, ndcg, ranks))
+                # ranks = self.get_t_ranks(h, r, [tw.index for tw in tw_truth])
+                # res.append((h,r,tw_truth, ndcg, ranks))
 
-        return ndcg_sum / count, exp_ndcg_sum / count
+        return ndcg_sum / count, exp_ndcg_sum / count, ndcg_sum_r / count_r, count_r, all_ndcg
+
+    def mean_rank(self, hr_map, weighted = False, verbose=False, accurate_mode=False):
+        """
+        :param hr_map: {h:{r:{t:w}}}
+        :param weighted: use linearly weighted metrics
+        :param accurate_mode: set this flag to disable "Fast Ranking"
+        :return:
+        """
+        rank_sum = 0  # nDCG with linear gain
+        count = 0
+
+        t0 = time.time()
+
+        # debug ndcg
+        res = []  # [(h,r,tw_truth, ndcg)]
+
+
+        all_rank = []
+
+
+        for h in hr_map:
+            for r in hr_map[h]:
+                tw_dict = hr_map[h][r]  # {t:w}
+                tw_truth = [self.IndexScore(t, w) for t, w in tw_dict.items()]
+                tw_truth.sort(reverse=True)  # descending on w
+                ts = [tw.index for tw in tw_truth]
+                ranks = self.get_t_ranks(h, r, ts, accurate_mode=accurate_mode)
+                
+                if weighted: 
+                    weight = np.array([tw.score for tw in tw_truth])
+                    rank_sum += sum(ranks*weight)
+                    count += sum(weight)
+
+                else:
+                    rank_sum += sum(ranks)
+                    count += ranks.shape[0]
+                
+                all_rank.append(ranks)
+
+
+                if verbose:
+                    print(h, r, ranks)
+                    
+
+
+        return rank_sum / count, all_rank
+
+    def mean_hitAtK(self, hr_map, ks, weighted = None, verbose=False, accurate_mode=False):
+        """
+        :param hr_map: {h:{r:{t:w}}}
+        :param weighted: use linearly weighted metrics
+        :param accurate_mode: set this flag to disable "Fast Ranking"
+        :return:
+        """
+        # hitAt10_sum = 0  # nDCG with linear gain
+        # count = 0
+
+        hitAtK = np.zeros((len(ks),))
+        count = np.zeros((len(ks),))
+
+        if weighted == None:
+            weighted = [False for _ in range(len(ks))]
+        else:
+            assert len(weighted) == len(ks)
+
+
+        all_rank = []
+        t0 = time.time()
+
+        debug_count = 0
+        for h in hr_map:
+            for r in hr_map[h]:
+                tw_dict = hr_map[h][r]  # {t:w}
+                tw_truth = [self.IndexScore(t, w) for t, w in tw_dict.items()]
+                tw_truth.sort(reverse=True)  # descending on w
+                ts = [tw.index for tw in tw_truth]
+                ranks = self.get_t_ranks(h, r, ts, accurate_mode=accurate_mode)
+
+                for k_idx, k in enumerate(ks):
+                    if weighted[k_idx]: 
+                        weight = np.array([tw.score for tw in tw_truth])
+                        hitAtK[k_idx] += sum((ranks <= k)*weight)
+                        count[k_idx] += sum(weight)
+                    else:
+                        hitAtK[k_idx] += sum(ranks <= k)
+                        count[k_idx] += ranks.shape[0]
+
+                    # all_rank.append(ranks)
+
+
+                if verbose:
+                    print(h, r, ranks)
+                
+
+        # print('count: ',count)
+        return hitAtK / count, all_rank
+
+    def mean_precision(self, hr_map, verbose=False, accurate_mode=False):
+        """
+        :param hr_map: {h:{r:{t:w}}}
+        :param accurate_mode: set this flag to disable "Fast Ranking"
+        :return:
+        """
+        precision_sum = 0  # nDCG with linear gain
+        count = 0
+
+        t0 = time.time()
+
+        all_rank = []
+
+
+        N = self.vec_c.shape[0]  # the total number of concepts
+        for h in hr_map:
+            for r in hr_map[h]:
+                tw_dict = hr_map[h][r]  # {t:w}
+                tw_truth = [self.IndexScore(t, w) for t, w in tw_dict.items()]
+                tw_truth.sort(reverse=True)  # descending on w
+                ts = [tw.index for tw in tw_truth]
+
+                scores_cache = self.get_score_batch(
+                    np.repeat(h, N), 
+                    np.repeat(r, N), 
+                    np.arange(0, N)
+                )
+                scores = scores_cache[ts]
+                precision_sum += sum(scores >= 0.5)
+                count += scores.shape[0]
+                all_rank.append(scores)
+
+
+                if verbose:
+                    print(h, r)
+                    
+                    if count % 50 == 0:
+                        print('Processed %d, time %s' % (count, (time.time() - t0)))
+                        print('mean rank now: %f' % (precision_sum / count))
+                        print('ts', ts)
+                        print('scores: ', scores)
+
+        print('count: ',count)
+        return precision_sum / count, all_rank
+
 
 
     def classify_triples(self, confT, plausTs):
@@ -561,6 +802,7 @@ class Tester(object):
 
         # prediction
         scores = self.get_score_batch(h_batch, r_batch, t_batch)
+        # print(scores[:1000])
         print('The mean of prediced scores: %f' % np.mean(scores))
         # pred_thres = np.arange(0, 1, 0.05)
         for pthres in plausTs:
@@ -574,6 +816,7 @@ class Tester(object):
                 precision = 1
             else:
                 precision = len(TP) / len(high_pred)
+
 
             recall = len(TP) / len(high_gt)
             P.append(precision)
@@ -668,6 +911,40 @@ class Tester(object):
 
 
 
+    def find_false_negatives(self, hr_map):
+        """
+        :param hr_map: {h:{r:{t:w}}}
+        :return:
+        """
+
+        results = []
+
+        N = self.vec_c.shape[0]  # the total number of concepts
+        for h in hr_map:
+            for r in hr_map[h]:
+                tw_dict = hr_map[h][r]  # {t:w}
+                existing_items = [t for t, w in tw_dict.items()]
+                # existing_items_mask = np.ones((N,), dtype=bool)
+                # existing_items_mask[existing_items] = False
+                scores_cache = self.get_score_batch(
+                    np.repeat(h, N), 
+                    np.repeat(r, N), 
+                    np.arange(0, N)
+                )
+                scores_cache[existing_items] = -1 # remove existing item
+                candidate_false_negatives = np.argwhere(scores_cache > 0.7).flatten()
+
+                # print('h: %s, r: %s:'%(self.con_index2str(h), self.rel_index2str(r)))
+                for candidate in candidate_false_negatives:
+                    results.append([self.con_index2str(h), self.rel_index2str(r), self.con_index2str(candidate), scores_cache[candidate]])
+                    # print('%s: %.4f'%(self.con_index2str(candidate), scores_cache[candidate]))
+
+        return results
+                
+
+
+
+
 class UKGE_logi_Tester(Tester):
     def __init__(self, ):
         Tester.__init__(self)
@@ -689,11 +966,10 @@ class UKGE_logi_Tester(Tester):
                                      dim=self.this_data.dim,
                                      batch_size=self.this_data.batch_size, neg_per_positive=10, p_neg=1)
         # neg_per_positive, reg_scale and p_neg are not used in testing
-        sess = tf.Session()
+        self.sess = sess = tf.Session()
         self.tf_parts._saver.restore(sess, model_save_path)  # load it
         value_ht, value_r, w, b = sess.run(
             [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
-        sess.close()
         self.vec_c = np.array(value_ht)
         self.vec_r = np.array(value_r)
         self.w = w
@@ -712,6 +988,8 @@ class UKGE_logi_Tester(Tester):
         self.test_triples = test_data
         self.tf_parts = tf_model
 
+        self.sess = sess
+
         value_ht, value_r, w, b = sess.run(
             [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
         self.vec_c = np.array(value_ht)
@@ -726,14 +1004,27 @@ class UKGE_logi_Tester(Tester):
 
     # override
     def get_score_batch(self, h_batch, r_batch, t_batch, isneg2Dbatch=False):
-        hvecs = self.con_index2vec_batch(h_batch)
-        rvecs = self.rel_index2vec_batch(r_batch)
-        tvecs = self.con_index2vec_batch(t_batch)
-        if isneg2Dbatch:
-            axis = 2  # axis for reduce_sum
-        else:
-            axis = 1
-        return sigmoid(self.w*np.sum(np.multiply(np.multiply(hvecs, tvecs), rvecs), axis=axis)+self.b)
+        N = h_batch.shape[0] # batch size
+        scores = np.zeros(h_batch.shape) # [batch size] or [batch size, neg sample]
+        for base_idx in range(0, N, self.tf_parts.batch_size_eval):
+            effective_bs = min(self.tf_parts.batch_size_eval, N - base_idx)
+
+            if isneg2Dbatch:
+                scores_tmp = self.sess.run([self.tf_parts._f_prob_hn], feed_dict={
+                    self.tf_parts._A_neg_hn_index:     h_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_neg_rel_hn_index: r_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_neg_t_index:      t_batch[base_idx:base_idx + effective_bs]
+                    })
+            else:
+                scores_tmp = self.sess.run([self.tf_parts._f_prob_h], feed_dict={
+                    self.tf_parts._A_h_index: h_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_r_index: r_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_t_index: t_batch[base_idx:base_idx + effective_bs]
+                    })
+
+            scores[base_idx:base_idx + effective_bs] = scores_tmp[0]
+
+        return scores
 
 
 class UKGE_rect_Tester(Tester):
@@ -894,3 +1185,1452 @@ class UKGE_rect_Tester(Tester):
         mse = (mse_hn + mse_tn) / 2
         return mse
 
+
+
+
+class TransE_m1_Tester(Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = TransE_m1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=10, p_neg=1)
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        sess.close()
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+    # override
+    def build_by_var(self, test_data, tf_model, this_data, sess=tf.Session()):
+        """
+        use data and model in memory.
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        self.this_data = this_data  # data.Data()
+
+        self.test_triples = test_data
+        self.tf_parts = tf_model
+
+        value_ht, value_r = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+
+    # override
+    def get_score(self, h, r, t):
+        hvec, rvec, tvec = self.vecs_from_triples(h, r, t)
+        return self.tf_parts.score_function(hvec, rvec, tvec,numpy=True)
+
+    # override
+    def get_score_batch(self, h_batch, r_batch, t_batch, isneg2Dbatch=False):
+        hvecs = self.con_index2vec_batch(h_batch)
+        rvecs = self.rel_index2vec_batch(r_batch)
+        tvecs = self.con_index2vec_batch(t_batch)
+        # if isneg2Dbatch:
+        #     axis = 2  # axis for reduce_sum
+        # else:
+        #     axis = 1
+        return self.tf_parts.score_function(hvecs, rvecs, tvecs,numpy=True)
+
+
+
+
+class DistMult_m1_Tester(Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = Distmult_m1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=10, p_neg=1)
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        sess.close()
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+    # override
+    def build_by_var(self, test_data, tf_model, this_data, sess=tf.Session()):
+        """
+        use data and model in memory.
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        self.this_data = this_data  # data.Data()
+
+        self.test_triples = test_data
+        self.tf_parts = tf_model
+
+        value_ht, value_r= sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+
+    # override
+    def get_score(self, h, r, t):
+        hvec, rvec, tvec = self.vecs_from_triples(h, r, t)
+        return (np.sum(np.multiply(np.multiply(hvec, tvec), rvec)))
+
+    # override
+    def get_score_batch(self, h_batch, r_batch, t_batch, isneg2Dbatch=False):
+        hvecs = self.con_index2vec_batch(h_batch)
+        rvecs = self.rel_index2vec_batch(r_batch)
+        tvecs = self.con_index2vec_batch(t_batch)
+        if isneg2Dbatch:
+            axis = 2  # axis for reduce_sum
+        else:
+            axis = 1
+        return (np.sum(np.multiply(np.multiply(hvecs, tvecs), rvecs), axis=axis))
+
+
+
+
+class DistMult_m2_Tester(Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = Distmult_m2_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=10, p_neg=1)
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        sess.close()
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+    # override
+    def build_by_var(self, test_data, tf_model, this_data, sess=tf.Session()):
+        """
+        use data and model in memory.
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        self.this_data = this_data  # data.Data()
+
+        self.test_triples = test_data
+        self.tf_parts = tf_model
+
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+    # override
+    def get_score(self, h, r, t):
+        hvec, rvec, tvec = self.vecs_from_triples(h, r, t)
+        return sigmoid(self.w*np.sum(np.multiply(np.multiply(hvec, tvec), rvec))+self.b)
+
+    # override
+    def get_score_batch(self, h_batch, r_batch, t_batch, isneg2Dbatch=False):
+        hvecs = self.con_index2vec_batch(h_batch)
+        rvecs = self.rel_index2vec_batch(r_batch)
+        tvecs = self.con_index2vec_batch(t_batch)
+        if isneg2Dbatch:
+            axis = 2  # axis for reduce_sum
+        else:
+            axis = 1
+        return sigmoid(self.w*np.sum(np.multiply(np.multiply(hvecs, tvecs), rvecs), axis=axis)+self.b)
+
+
+
+
+class ComplEx_m1_Tester(Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=10, p_neg=1)
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        sess.close()
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+    # override
+    def build_by_var(self, test_data, tf_model, this_data, sess=tf.Session()):
+        """
+        use data and model in memory.
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        self.this_data = this_data  # data.Data()
+
+        self.test_triples = test_data
+        self.tf_parts = tf_model
+
+        value_ht, value_r = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+
+    # override
+    def get_score(self, h, r, t):
+        hvec, rvec, tvec = self.vecs_from_triples(h, r, t)
+
+        hvec_real, hvec_imag = self.tf_parts.split_embed_real_imag(hvec, numpy=True)
+        rvec_real, rvec_imag = self.tf_parts.split_embed_real_imag(rvec, numpy=True)
+        tvec_real, tvec_imag = self.tf_parts.split_embed_real_imag(tvec, numpy=True)
+        
+        
+        return self.tf_parts.score_function(
+            hvec_real, hvec_imag, 
+            tvec_real, tvec_imag, 
+            rvec_real, rvec_imag, numpy=True)
+
+    # override
+    def get_score_batch(self, h_batch, r_batch, t_batch, isneg2Dbatch=False):
+        hvecs = self.con_index2vec_batch(h_batch)
+        rvecs = self.rel_index2vec_batch(r_batch)
+        tvecs = self.con_index2vec_batch(t_batch)
+
+        hvecs_real, hvecs_imag = self.tf_parts.split_embed_real_imag(hvecs, numpy=True)
+        rvecs_real, rvecs_imag = self.tf_parts.split_embed_real_imag(rvecs, numpy=True)
+        tvecs_real, tvecs_imag = self.tf_parts.split_embed_real_imag(tvecs, numpy=True)
+        
+        
+        # if isneg2Dbatch:
+        #     axis = 2  # axis for reduce_sum
+        # else:
+        #     axis = 1
+        return self.tf_parts.score_function(
+            hvecs_real, hvecs_imag, 
+            tvecs_real, tvecs_imag, 
+            rvecs_real, rvecs_imag, numpy=True)
+
+
+class ComplEx_m3_Tester(ComplEx_m1_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m3_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=10, p_neg=1)
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        sess.close()
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+
+
+class ComplEx_m4_Tester(Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m4_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=10, p_neg=1)
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        sess.close()
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+    # override
+    def build_by_var(self, test_data, tf_model, this_data, sess=tf.Session()):
+        """
+        use data and model in memory.
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        self.this_data = this_data  # data.Data()
+
+        self.test_triples = test_data
+        self.tf_parts = tf_model
+
+        self.sess = sess
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+    # override
+    def get_score(self, h, r, t):
+        hvec, rvec, tvec = self.vecs_from_triples(h, r, t)
+
+        hvec_real, hvec_imag = self.tf_parts.split_embed_real_imag(hvec, numpy=True)
+        rvec_real, rvec_imag = self.tf_parts.split_embed_real_imag(rvec, numpy=True)
+        tvec_real, tvec_imag = self.tf_parts.split_embed_real_imag(tvec, numpy=True)
+        
+        return self.tf_parts.score_function(
+            hvec_real, hvec_imag, 
+            tvec_real, tvec_imag, 
+            rvec_real, rvec_imag, numpy=True, numpy_w=self.w, numpy_b=self.b)
+
+    # override
+    def get_score_batch(self, h_batch, r_batch, t_batch, isneg2Dbatch=False):
+        N = h_batch.shape[0] # batch size
+        scores = np.zeros(h_batch.shape) # [batch size] or [batch size, neg sample]
+        for base_idx in range(0, N, self.tf_parts.batch_size_eval):
+            effective_bs = min(self.tf_parts.batch_size_eval, N - base_idx)
+
+            if isneg2Dbatch:
+                scores_tmp = self.sess.run([self.tf_parts._f_score_hn], feed_dict={
+                    self.tf_parts._A_neg_hn_index:     h_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_neg_rel_hn_index: r_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_neg_t_index:      t_batch[base_idx:base_idx + effective_bs]
+                    })
+            else:
+                scores_tmp = self.sess.run([self.tf_parts._f_score_h], feed_dict={
+                    self.tf_parts._A_h_index: h_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_r_index: r_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_t_index: t_batch[base_idx:base_idx + effective_bs]
+                    })
+
+            scores[base_idx:base_idx + effective_bs] = scores_tmp[0]
+
+        return scores
+        
+        
+        # if isneg2Dbatch:
+        #     axis = 2  # axis for reduce_sum
+        # else:
+        #     axis = 1
+
+
+
+
+class ComplEx_m5_1_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m5_1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+
+class ComplEx_m5_2_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m5_2_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+class ComplEx_m5_3_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m5_3_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+class ComplEx_m5_4_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m5_4_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+
+
+class ComplEx_m6_1_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m6_1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+class ComplEx_m6_2_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m6_2_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+
+
+class ComplEx_m9_2_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m9_2_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+
+class ComplEx_m9_3_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m9_3_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+
+
+
+
+
+class ComplEx_m10_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m10_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+
+class ComplEx_m10_1_Tester(ComplEx_m10_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m10_1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+class ComplEx_m10_2_Tester(ComplEx_m10_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m10_2_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+
+
+class ComplEx_m10_3_Tester(ComplEx_m10_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m10_3_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+class ComplEx_m10_4_Tester(ComplEx_m10_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = ComplEx_m10_4_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+
+
+
+
+
+
+class RotatE_m1_Tester(Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = RotatE_m1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=10, p_neg=1)
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        # when a model doesn't have Mt, suppose it should pass Mh
+
+    # override
+    def build_by_var(self, test_data, tf_model, this_data, sess=tf.Session()):
+        """
+        use data and model in memory.
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        self.this_data = this_data  # data.Data()
+
+        self.test_triples = test_data
+        self.tf_parts = tf_model
+
+        self.sess = sess
+
+        value_ht, value_r = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+
+    # override
+    def get_score(self, h, r, t):
+        hvec, rvec, tvec = self.vecs_from_triples(h, r, t)
+
+        hvec_real, hvec_imag = self.tf_parts.split_embed_real_imag(hvec, numpy=True)
+        tvec_real, tvec_imag = self.tf_parts.split_embed_real_imag(tvec, numpy=True)
+        
+        
+        return self.tf_parts.score_function(
+            hvec_real, hvec_imag, 
+            tvec_real, tvec_imag, 
+            rvec, numpy=True)
+
+    # override
+    def get_score_batch(self, h_batch, r_batch, t_batch, isneg2Dbatch=False):
+        N = h_batch.shape[0] # batch size
+        scores = np.zeros(h_batch.shape) # [batch size] or [batch size, neg sample]
+        for base_idx in range(0, N, self.tf_parts.batch_size_eval):
+            effective_bs = min(self.tf_parts.batch_size_eval, N - base_idx)
+
+            if isneg2Dbatch:
+                scores_tmp = self.sess.run([self.tf_parts._f_score_hn], feed_dict={
+                    self.tf_parts._A_neg_hn_index:     h_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_neg_rel_hn_index: r_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_neg_t_index:      t_batch[base_idx:base_idx + effective_bs]
+                    })
+            else:
+                scores_tmp = self.sess.run([self.tf_parts._f_score_h], feed_dict={
+                    self.tf_parts._A_h_index: h_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_r_index: r_batch[base_idx:base_idx + effective_bs],
+                    self.tf_parts._A_t_index: t_batch[base_idx:base_idx + effective_bs]
+                    })
+
+            scores[base_idx:base_idx + effective_bs] = scores_tmp[0]
+
+        return scores
+        
+class RotatE_m2_Tester(RotatE_m1_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = RotatE_m2_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, 
+                                     neg_per_positive=param.neg_per_pos, 
+                                     p_neg=1, psl=(param.n_psl > 0),
+                                     gamma=1)
+
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+
+class RotatE_m2_1_Tester(RotatE_m1_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = RotatE_m2_1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, 
+                                     neg_per_positive=param.neg_per_pos, 
+                                     p_neg=1, psl=(param.n_psl > 0),
+                                     gamma=1)
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+
+
+
+
+
+
+class UKGE_logi_m1_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = UKGE_logi_m1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+
+class UKGE_logi_m2_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = UKGE_logi_m2_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+class RotatE_m3_1_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = RotatE_m3_1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+class RotatE_m3_2_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = RotatE_m3_2_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+class RotatE_m2_2_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = RotatE_m2_2_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+class RotatE_m3_3_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = RotatE_m3_3_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+
+class RotatE_m5_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = RotatE_m5_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0), gamma=2)
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+class RotatE_m5_1_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = RotatE_m5_1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0), gamma=2)
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+
+class TransE_m3_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = TransE_m3_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+class TransE_m3_1_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = TransE_m3_1_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+class TransE_m3_3_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='model.bin', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+        Tester.build_by_file(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.tf_parts = TransE_m3_3_TF(num_rels=self.this_data.num_rels(),
+                                     num_cons=self.this_data.num_cons(),
+                                     dim=self.this_data.dim,
+                                     batch_size=self.this_data.batch_size, neg_per_positive=param.neg_per_pos, p_neg=1, psl=(param.n_psl > 0))
+        # neg_per_positive, reg_scale and p_neg are not used in testing
+        self.sess = sess = tf.Session()
+        self.tf_parts._saver.restore(sess, model_save_path)  # load it
+        value_ht, value_r, w, b = sess.run(
+            [self.tf_parts._ht, self.tf_parts._r, self.tf_parts.w, self.tf_parts.b])  # extract values.
+        self.vec_c = np.array(value_ht)
+        self.vec_r = np.array(value_r)
+        self.w = w
+        self.b = b
+
+
+class OpenKE_Tester(ComplEx_m4_Tester):
+    def __init__(self, ):
+        Tester.__init__(self)
+    
+    # virtual function
+    def init_tf_parts(self):
+        raise NotImplementedError
+
+    # override
+    def build_by_file(self, test_data_file, model_dir, model_filename='complEx.ckpt', data_filename='data.bin'):
+        """
+        load data and model from files
+        get self.vec_c (vectors for concepts), and self.vec_r(vectors for relations)
+        :return:
+        """
+
+        
+        import torch
+
+        Tester.build_by_file_no_id_mapping(self, test_data_file, model_dir, model_filename,
+                             data_filename)
+
+
+        # load tf model and embeddings
+        model_save_path = join(model_dir, model_filename)
+        self.init_tf_parts()
+        
+        self.tf_parts.batch_size_eval = 2048
+
+        self.tf_parts.cuda()
+        self.tf_parts.load_checkpoint(model_save_path)  # load it
+
+
+        self.vec_c = np.zeros((self.this_data.num_cons(), ))
+        self.vec_r = np.zeros((self.this_data.num_rels(), ))
+        # self.w = w
+        # self.b = b
+
+
+    def to_var(self, x, use_gpu):
+
+        import torch
+        from torch.autograd import Variable
+
+        if use_gpu:
+            return Variable(torch.from_numpy(x).cuda())
+        else:
+            return Variable(torch.from_numpy(x))
+
+    # override
+    def get_score(self, h, r, t):
+        raise NotImplementedError
+
+    # override
+    def get_score_batch(self, h_batch, r_batch, t_batch, isneg2Dbatch=False):
+        N = h_batch.shape[0] # batch size
+        scores = np.zeros(h_batch.shape) # [batch size] or [batch size, neg sample]
+        for base_idx in range(0, N, self.tf_parts.batch_size_eval):
+            effective_bs = min(self.tf_parts.batch_size_eval, N - base_idx)
+
+            if isneg2Dbatch:
+                # print(r_batch.flatten()[:1000])
+                shape = (effective_bs, h_batch.shape[1])
+                scores_tmp = -self.tf_parts.predict({
+                    'batch_h': self.to_var(h_batch[base_idx:base_idx + effective_bs].flatten(), 1),
+                    'batch_t': self.to_var(t_batch[base_idx:base_idx + effective_bs].flatten(), 1),
+                    'batch_r': self.to_var(r_batch[base_idx:base_idx + effective_bs].flatten(), 1),
+                    'mode': 'tail_batch'
+                })
+                scores_tmp = np.reshape(scores_tmp, shape)
+            else:
+                scores_tmp = -self.tf_parts.predict({
+                    'batch_h': self.to_var(h_batch[base_idx:base_idx + effective_bs], 1),
+                    'batch_t': self.to_var(t_batch[base_idx:base_idx + effective_bs], 1),
+                    'batch_r': self.to_var(r_batch[base_idx:base_idx + effective_bs], 1),
+                    'mode': 'tail_batch'
+                })
+
+            scores[base_idx:base_idx + effective_bs] = scores_tmp
+
+        return scores
+
+class ComplEx_Tester(OpenKE_Tester):
+    # override
+    def init_tf_parts(self):
+        from openke.module.model import ComplEx
+        
+        self.tf_parts = ComplEx(
+            ent_tot = self.this_data.num_cons(),
+            rel_tot = self.this_data.num_rels(),
+            dim = 512
+        )
+
+
+class DistMult_Tester(OpenKE_Tester):
+    # override
+    def init_tf_parts(self):
+        from openke.module.model import DistMult
+
+        self.tf_parts = DistMult(
+            ent_tot = self.this_data.num_cons(),
+            rel_tot = self.this_data.num_rels(),
+            dim = 512
+        )
+
+
+class RotatE_Tester(OpenKE_Tester):
+    # override
+    def init_tf_parts(self):
+        from openke.module.model import RotatE
+
+        self.tf_parts = RotatE(
+            ent_tot = self.this_data.num_cons(),
+            rel_tot = self.this_data.num_rels(),
+            dim = 512
+        )
